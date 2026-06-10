@@ -139,8 +139,12 @@ ros2 launch neupan_ros2 sim_complete.launch.py sim_env_config:=scenario_maze.yam
 ```
 
 **Available Environment Configs**:
-- `sim_env_obs.yaml`: Basic obstacle environment
-- `sim_env_obs_exam.yaml`: Complex obstacle course (default)
+- `scenario_maze.yaml`: Maze scenario (default)
+- `scenario_corridor.yaml`: Corridor scenario
+- `scenario_narrow_passage.yaml`: Narrow passage scenario
+- `scenario_u_trap.yaml`: U-trap scenario
+- `scenario_polygon_random.yaml`: Random polygon obstacle scenario
+- `scenario_empty.yaml`: Open-space scenario
 
 ### 🤖 2. Real Robot Mode
 
@@ -190,6 +194,12 @@ config/robots/
 │   └── models/
 │       └── dune_model_5000.pth
 │
+├── scout/                         # Scout robot configuration
+│   ├── robot.yaml
+│   ├── planner.yaml
+│   └── models/
+│       └── dune_model_5000.pth
+│
 ├── simulation/                    # Simulation configuration
 │   ├── robot.yaml
 │   ├── planner.yaml
@@ -211,6 +221,7 @@ config/robots/
 |-------|-----------|------------------|-----------|----------------|
 | **LIMO** | Differential | 0.322m × 0.22m | N/A | `ros2 launch neupan_ros2 limo.launch.py` |
 | **Ranger** | Ackermann | 0.720m × 0.500m | 0.500m | `ros2 launch neupan_ros2 ranger.launch.py` |
+| **Scout** | Differential | 0.615m × 0.585m | N/A | `ros2 launch neupan_ros2 scout.launch.py` |
 | **Simulation** | Differential | 0.322m × 0.22m | N/A | `ros2 launch neupan_ros2 simulation.launch.py` |
 
 ### Configuration Files
@@ -377,6 +388,7 @@ map
 | `sim_complete.launch.py` | Full simulation system with ddr_minimal_sim | Complete simulation testing |
 | `limo.launch.py` | LIMO robot deployment | LIMO differential drive robot |
 | `ranger.launch.py` | Ranger robot deployment | Ranger ackermann robot |
+| `scout.launch.py` | Scout robot deployment | Scout differential drive robot |
 
 ---
 

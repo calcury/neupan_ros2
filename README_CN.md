@@ -114,7 +114,7 @@ source install/setup.bash
 **仿真 + NeuPAN:**
 ```bash
 source install/setup.bash
-ros2 launch neupan_ros2 sim_diff_launch.py sim_env_config:=scenario_corridor.yaml
+ros2 launch neupan_ros2 sim_complete.launch.py sim_env_config:=scenario_corridor.yaml
 ```
 
 **可用场景:** 查看 [ddr_minimal_sim 场景列表](src/ddr_minimal_sim/README.md#pre-configured-scenarios) 获取完整列表（走廊、迷宫、窄通道、U型陷阱、随机障碍、空旷空间）
@@ -127,7 +127,7 @@ ros2 launch neupan_ros2 sim_diff_launch.py sim_env_config:=scenario_corridor.yam
 
 ```bash
 # 确保 Limo 驱动正在运行
-ros2 launch neupan_ros2 limo_diff_launch.py
+ros2 launch neupan_ros2 limo.launch.py
 ```
 
 #### 场景 2: 完整仿真
@@ -135,9 +135,9 @@ ros2 launch neupan_ros2 limo_diff_launch.py
 完整系统（仿真器 + NeuPAN 规划器）:
 
 ```bash
-ros2 launch neupan_ros2 sim_diff_launch.py
+ros2 launch neupan_ros2 sim_complete.launch.py
 
-ros2 launch neupan_ros2 sim_diff_launch.py sim_env_config:=scenario_maze.yaml
+ros2 launch neupan_ros2 sim_complete.launch.py sim_env_config:=scenario_maze.yaml
 ```
 
 ### 包详情
@@ -169,7 +169,7 @@ colcon build --packages-select ddr_minimal_sim
 #### 自定义
 
 - **仿真器场景**: 参见 [ddr_minimal_sim 开发指南](src/ddr_minimal_sim/README.md#development) 了解自定义场景
-- **NeuPAN 参数**: 修改 `src/neupan_ros2/config/neupan_config/neupan_sim_diff.yaml`
+- **NeuPAN 参数**: 修改 `src/neupan_ros2/config/robots/<robot>/planner.yaml`
 
 ### 持续集成
 
@@ -226,7 +226,7 @@ colcon build --packages-select ddr_minimal_sim
 <details>
 <summary>NeuPAN 模型未找到</summary>
 
-- 检查模型文件存在: `src/neupan_ros2/config/dune_checkpoint/model_5000.pth`
+- 检查模型文件存在: `src/neupan_ros2/config/robots/<robot>/models/dune_model_5000.pth`
 - 如果缺失，从仓库下载
 </details>
 

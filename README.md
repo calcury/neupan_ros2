@@ -114,7 +114,7 @@ source install/setup.bash
 **Simulation with NeuPAN:**
 ```bash
 source install/setup.bash
-ros2 launch neupan_ros2 sim_diff_launch.py sim_env_config:=scenario_corridor.yaml
+ros2 launch neupan_ros2 sim_complete.launch.py sim_env_config:=scenario_corridor.yaml
 ```
 
 **Alternative scenarios:** See [ddr_minimal_sim scenarios](src/ddr_minimal_sim/README.md#pre-configured-scenarios) for complete list (corridor, maze, narrow_passage, u_trap, polygon_random, empty)
@@ -127,7 +127,7 @@ Deploy NeuPAN on physical Limo robot:
 
 ```bash
 # Make sure Limo drivers are running
-ros2 launch neupan_ros2 limo_diff_launch.py
+ros2 launch neupan_ros2 limo.launch.py
 ```
 
 #### Scenario 2: Complete Simulation
@@ -135,9 +135,9 @@ ros2 launch neupan_ros2 limo_diff_launch.py
 Full system with simulator + NeuPAN planner:
 
 ```bash
-ros2 launch neupan_ros2 sim_diff_launch.py
+ros2 launch neupan_ros2 sim_complete.launch.py
 
-ros2 launch neupan_ros2 sim_diff_launch.py sim_env_config:=scenario_maze.yaml
+ros2 launch neupan_ros2 sim_complete.launch.py sim_env_config:=scenario_maze.yaml
 ```
 
 ### Package Details
@@ -170,7 +170,7 @@ colcon build --packages-select ddr_minimal_sim
 #### Customization
 
 - **Simulator scenarios**: See [ddr_minimal_sim development guide](src/ddr_minimal_sim/README.md#development) for custom scenarios
-- **NeuPAN parameters**: Modify `src/neupan_ros2/config/neupan_config/neupan_sim_diff.yaml`
+- **NeuPAN parameters**: Modify `src/neupan_ros2/config/robots/<robot>/planner.yaml`
 
 ### Continuous Integration
 
@@ -229,7 +229,7 @@ This maintains consistency with [NeuPAN-ROS](https://github.com/hanruihua/neupan
 <details>
 <summary>NeuPAN model not found</summary>
 
-- Check model file exists: `src/neupan_ros2/config/dune_checkpoint/model_5000.pth`
+- Check model file exists: `src/neupan_ros2/config/robots/<robot>/models/dune_model_5000.pth`
 - Download from repository if missing
 </details>
 

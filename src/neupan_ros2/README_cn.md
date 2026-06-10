@@ -124,15 +124,19 @@ source install/setup.bash
 source ~/neupan_ws/install/setup.bash
 
 # 使用默认环境启动
-ros2 launch neupan_ros2 sim_diff_launch.py
+ros2 launch neupan_ros2 sim_complete.launch.py
 
 # 或指定自定义环境配置
-ros2 launch neupan_ros2 sim_diff_launch.py sim_env_config:=sim_env_obs.yaml use_rviz:=true
+ros2 launch neupan_ros2 sim_complete.launch.py sim_env_config:=scenario_corridor.yaml use_rviz:=true
 ```
 
 **可用环境配置**：
-- `sim_env_obs.yaml`：基础障碍物环境
-- `sim_env_obs_exam.yaml`：复杂障碍物场景（默认）
+- `scenario_maze.yaml`：迷宫场景（默认）
+- `scenario_corridor.yaml`：走廊场景
+- `scenario_narrow_passage.yaml`：窄通道场景
+- `scenario_u_trap.yaml`：U 型陷阱场景
+- `scenario_polygon_random.yaml`：随机多边形障碍场景
+- `scenario_empty.yaml`：空旷场景
 
 ### 🤖 2. 实体机器人模式（Limo 平台）
 
@@ -140,10 +144,10 @@ ros2 launch neupan_ros2 sim_diff_launch.py sim_env_config:=sim_env_obs.yaml use_
 
 ```bash
 # 在 Limo 机器人上启动 NeuPAN
-ros2 launch neupan_ros2 limo_diff_launch.py
+ros2 launch neupan_ros2 limo.launch.py
 
-# 使用自定义配置
-ros2 launch neupan_ros2 limo_diff_launch.py config:=limo_diff.yaml
+# 不启动 RViz
+ros2 launch neupan_ros2 limo.launch.py use_rviz:=false
 ```
 
 > **注意**：本软件包已针对 [AgileX Limo ROS2](https://www.agilex.ai/education/18) 机器人进行优化。如需了解该平台信息，请联系我们的合作伙伴：sales@hive-matrix.com。
@@ -151,8 +155,8 @@ ros2 launch neupan_ros2 limo_diff_launch.py config:=limo_diff.yaml
 ### ⚙️ 3. 自定义配置
 
 ```bash
-# 使用自定义参数文件启动
-ros2 launch neupan_ros2 neupan_launch.py config:=neupan_params.yaml
+# 独立启动 NeuPAN 节点（不包含 ddr_minimal_sim）
+ros2 launch neupan_ros2 simulation.launch.py
 ```
 
 ---
@@ -164,12 +168,27 @@ ros2 launch neupan_ros2 neupan_launch.py config:=neupan_params.yaml
 配置文件位于：
 ```
 config/
-├── limo_diff.yaml              # Limo 机器人配置
-├── sim_diff.yaml                # 仿真配置
-└── neupan_config/
-    ├── neupan_sim_diff.yaml     # NeuPAN 规划器参数
-    └── dune_checkpoint/
-        └── model_5000.pth       # 预训练神经网络模型
+└── robots/
+    ├── simulation/
+    │   ├── robot.yaml           # 仿真机器人 ROS 参数
+    │   ├── planner.yaml         # 仿真规划器参数
+    │   └── models/
+    │       └── dune_model_5000.pth
+    ├── limo/
+    │   ├── robot.yaml           # Limo 机器人 ROS 参数
+    │   ├── planner.yaml         # Limo 规划器参数
+    │   └── models/
+    │       └── dune_model_5000.pth
+    ├── scout/
+    │   ├── robot.yaml           # Scout 机器人 ROS 参数
+    │   ├── planner.yaml         # Scout 规划器参数
+    │   └── models/
+    │       └── dune_model_5000.pth
+    └── ranger/
+        ├── robot.yaml
+        ├── planner.yaml
+        └── models/
+            └── dune_model_5000.pth
 ```
 
 ### 关键参数
@@ -179,8 +198,8 @@ config/
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `use_sim_time` | 使用仿真时间 | `true`/`false` |
-| `neupan_config_file` | 规划器配置文件 | `neupan_sim_diff.yaml` |
-| `dune_checkpoint_file` | 神经网络模型文件 | `model_5000.pth` |
+| `planner_config_file` | 规划器配置文件 | `planner.yaml` |
+| `dune_checkpoint_file` | 神经网络模型文件 | `models/dune_model_5000.pth` |
 | `map_frame` | 全局坐标系 | `map` |
 | `base_frame` | 机器人基座坐标系 | `base_link` |
 | `scan_range_max` | 激光扫描最大距离（米） | `5.0` |
@@ -240,7 +259,7 @@ enable_robot_marker: true     # 仅保留机器人可视化
 - **低速机器人**（<0.5 m/s）：20-30 Hz 即可，节省 CPU
 - **嵌入式平台**：从 30 Hz 开始，根据需要增加
 
-完整参数文档请参见 [config/sim_diff.yaml](config/sim_diff.yaml)。
+完整参数文档请参见 [config/robots/simulation/robot.yaml](config/robots/simulation/robot.yaml) 和 [config/robots/simulation/planner.yaml](config/robots/simulation/planner.yaml)。
 
 ---
 
@@ -281,9 +300,11 @@ map
 
 | Launch 文件 | 用途 | 使用场景 |
 |-------------|------|----------|
-| `sim_diff_launch.py` | 完整仿真系统 | 仿真测试 |
-| `limo_diff_launch.py` | Limo 机器人部署 | 实体机器人导航 |
-| `neupan_launch.py` | 独立规划器节点 | 自定义集成 |
+| `sim_complete.launch.py` | 完整仿真系统，包含 ddr_minimal_sim 和 NeuPAN | 仿真测试 |
+| `simulation.launch.py` | 独立 NeuPAN 仿真配置，不启动 ddr_minimal_sim | 自定义集成与调试 |
+| `limo.launch.py` | Limo 机器人部署 | 实体机器人导航 |
+| `ranger.launch.py` | Ranger 机器人部署 | 实体机器人导航 |
+| `scout.launch.py` | Scout 机器人部署 | 实体机器人导航 |
 
 ---
 

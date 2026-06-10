@@ -18,6 +18,12 @@ robots/
 │   └── models/
 │       └── dune_model_5000.pth
 │
+├── scout/                  # Scout differential drive robot
+│   ├── robot.yaml
+│   ├── planner.yaml
+│   └── models/
+│       └── dune_model_5000.pth
+│
 ├── simulation/             # Simulated robot
 │   ├── robot.yaml
 │   ├── planner.yaml
@@ -38,6 +44,7 @@ robots/
 |-------|-----------|------------------|-----------|----------------|
 | **LIMO** | Differential | 0.322m × 0.22m | N/A | `ros2 launch neupan_ros2 limo.launch.py` |
 | **Ranger** | Ackermann | 0.720m × 0.500m | 0.500m | `ros2 launch neupan_ros2 ranger.launch.py` |
+| **Scout** | Differential | 0.615m × 0.585m | N/A | `ros2 launch neupan_ros2 scout.launch.py` |
 | **Simulation** | Differential | 0.322m × 0.22m | N/A | `ros2 launch neupan_ros2 simulation.launch.py` |
 
 ## Adding a New Robot

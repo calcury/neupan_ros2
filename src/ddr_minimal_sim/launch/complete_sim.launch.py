@@ -11,8 +11,8 @@ This launch file starts all components of the minimal differential drive simulat
   - RViz (optional)
 
 Usage:
-  ros2 launch ddr_minimal_sim complete_sim.launch.py sim_env_config:=sim_env_obs.yaml
-  ros2 launch ddr_minimal_sim complete_sim.launch.py sim_env_config:=sim_env_obs_exam.yaml rviz:=true
+  ros2 launch ddr_minimal_sim complete_sim.launch.py
+  ros2 launch ddr_minimal_sim complete_sim.launch.py sim_env_config:=scenario_corridor.yaml rviz:=true
 """
 
 from launch import LaunchDescription
@@ -27,7 +27,7 @@ def generate_launch_description():
     # Declare launch arguments
     sim_env_config_arg = DeclareLaunchArgument(
         'sim_env_config',
-        default_value='sim_env_obs.yaml',
+        default_value='scenario_maze.yaml',
         description='Simulation environment configuration file name (in config/ directory)'
     )
 

@@ -82,7 +82,7 @@ if [ $? -eq 0 ]; then
     echo ""
     echo -e "Quick start:"
     echo -e "  ${YELLOW}source install/setup.bash${NC}"
-    echo -e "  ${YELLOW}ros2 launch neupan_ros2 sim_diff_launch.py${NC}"
+    echo -e "  ${YELLOW}ros2 launch neupan_ros2 sim_complete.launch.py${NC}"
     echo ""
 else
     echo ""
