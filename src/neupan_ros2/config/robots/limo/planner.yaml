@@ -1,16 +1,16 @@
 # mpc
 receding: 8
-step_time: 0.25
+step_time: 0.5
 ref_speed: 0.5
 device: 'cpu'
 time_print: False
-collision_threshold: 0.01
+collision_threshold: -10.01
 
 # robot
 robot:
   kinematics: 'diff'
-  max_speed: [0.5, 2.0]
-  max_acce: [0.5, 2.0]
+  max_speed: [2.2, 2.5]
+  max_acce: [2.2, 2.5]
   length: 0.322
   width: 0.22
 
