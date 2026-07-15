@@ -9,20 +9,26 @@ planning algorithm, and publishes velocity commands to control the robot.
 Developer: Han Ruihua <hanrh@connect.hku.hk>  Li Chengyang <kevinladlee@gmail.com>
 Date: 2025.04.08
 
-Latency-aware real-robot revision (neupan_node_fixed.py)
--------------------------------------------------------
-相对原始 neupan_node.py 的延迟处理原则（避免 dc_neupan_node 中的脆化方案）:
+Latency-aware + TF-safe real-robot revision (classmate deliverable)
+-------------------------------------------------------------------
+针对真机日志中的:
+  TF@base_scan->odom ... extrapolation into the future ... falling back to latest
+  Predict horizon XXXms clamped to 350ms
 
-1. 点云用 scan 时间戳上的 TF 变换到 map（观测与位姿时间对齐）
-2. 规划用“当前” TF 位姿；可选地用里程计实测 twist (v,w) 做短时外推
-   到动作生效时刻（scan_age + 求解EMA + 执行延迟），不用发布的 cmd_hist 开环积分
-3. 对输出 cmd 做轻度一阶低通 + 加加速度限幅，抑制绕障后回参考线时的抖振
-4. 保留原始 NeuPAN 控制/规划/可视化/多线程结构，不重写整条流水线
+根因（已用现场 WARN 定量确认）:
+1) scan stamp 常比 TF latest 新 ~54ms（旧 timeout=0.05s 临界失败）或更大；
+2) 不安全的 latest 回退把扫点投到错误世界位姿（表现成车体/世界系 bug）；
+3) TF latest 有时落后 wall-clock 1–3s，回退后错位更严重；
+4) 在错位点云上再做 delay predict 叠加误差。
 
-对比实验开关:
-  compensate_delay:=false  → 仅时间戳同步点云，不做状态外推（最接近原版）
-  cmd_smoothing:=false     → 关闭输出滤波/限加速度
+修复要点:
+- 增大 tf_lookup_timeout 默认 0.25s，给 TF 赶上 stamp 的机会
+- 仅当 skew ≤ max_scan_tf_skew 时允许 clamp 到 latest；否则 DROPPING scan
+- TF age > max_tf_age 时丢弃扫描
+- scan TF 非精确对齐时跳过状态外推
+- 调试日志写到同学机 /tmp/neupan_debug_cc13b8.log（可用 NEUPAN_DEBUG_LOG 改路径）
 """
+import json
 import math
 import os
 import threading
@@ -64,6 +70,43 @@ from neupan_ros2.utils import yaw_to_quat, quat_to_yaw
 def _wrap_angle(a: float) -> float:
     """Wrap angle to [-pi, pi]."""
     return math.atan2(math.sin(a), math.cos(a))
+
+
+# #region agent log
+# Portable path for classmate machine (send this file back if needed):
+#   /tmp/neupan_debug_cc13b8.log
+_AGENT_DBG_PATH = os.environ.get(
+    "NEUPAN_DEBUG_LOG", "/tmp/neupan_debug_cc13b8.log"
+)
+_AGENT_DBG_COUNT = 0
+_AGENT_DBG_LOCK = threading.Lock()
+_AGENT_RUN_ID = os.environ.get("NEUPAN_DEBUG_RUN", "tf-fix")
+
+
+def _agent_dbg(hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    """Append one NDJSON debug line (rate-limited). Runs on classmate PC."""
+    global _AGENT_DBG_COUNT
+    try:
+        with _AGENT_DBG_LOCK:
+            _AGENT_DBG_COUNT += 1
+            if _AGENT_DBG_COUNT > 500:
+                return
+            n = _AGENT_DBG_COUNT
+        payload = {
+            "sessionId": "cc13b8",
+            "runId": _AGENT_RUN_ID,
+            "hypothesisId": hypothesis_id,
+            "id": f"log_{int(time.time()*1000)}_{n}",
+            "timestamp": int(time.time() * 1000),
+            "location": location,
+            "message": message,
+            "data": data,
+        }
+        with open(_AGENT_DBG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+# #endregion agent log
 
 
 class NeupanCore(Node):
@@ -140,8 +183,12 @@ class NeupanCore(Node):
         self.declare_parameter("actuation_delay", 0.08)
         # 外推时间上限，防止长时间开环漂移；超过则钳位并打日志
         self.declare_parameter("max_predict_horizon", 0.35)
-        # TF 查历史时允许的超时
-        self.declare_parameter("tf_lookup_timeout", 0.05)
+        # TF 查历史时允许的超时（真机常见 scan stamp 比 TF 新几十 ms，0.05 常不够）
+        self.declare_parameter("tf_lookup_timeout", 0.25)
+        # stamp 相对 TF latest 允许的最大 skew；更大则丢弃本帧扫描，禁止错位回退
+        self.declare_parameter("max_scan_tf_skew", 0.12)
+        # 超过该 TF 老化（latest 比 now 旧）时丢弃点云，避免秒级错位
+        self.declare_parameter("max_tf_age", 0.50)
         # 输出平滑：一阶低通 alpha∈(0,1]，越小越平滑；1=关闭低通
         self.declare_parameter("cmd_smoothing", True)
         self.declare_parameter("cmd_lpf_alpha", 0.35)
@@ -271,6 +318,12 @@ class NeupanCore(Node):
         self.tf_lookup_timeout = (
             self.get_parameter("tf_lookup_timeout").get_parameter_value().double_value
         )
+        self.max_scan_tf_skew = (
+            self.get_parameter("max_scan_tf_skew").get_parameter_value().double_value
+        )
+        self.max_tf_age = (
+            self.get_parameter("max_tf_age").get_parameter_value().double_value
+        )
         self.cmd_smoothing = (
             self.get_parameter("cmd_smoothing").get_parameter_value().bool_value
         )
@@ -314,6 +367,9 @@ class NeupanCore(Node):
             f"Latency compensate={self.compensate_delay}, "
             f"actuation_delay={self.actuation_delay:.3f}s, "
             f"max_predict={self.max_predict_horizon:.3f}s, "
+            f"tf_timeout={self.tf_lookup_timeout:.3f}s, "
+            f"max_scan_tf_skew={self.max_scan_tf_skew:.3f}s, "
+            f"max_tf_age={self.max_tf_age:.3f}s, "
             f"cmd_smoothing={self.cmd_smoothing}"
         )
 
@@ -335,6 +391,9 @@ class NeupanCore(Node):
         self._stat_scan_age: deque = deque(maxlen=300)
         self._stat_predict: deque = deque(maxlen=300)
         self._stat_solve: deque = deque(maxlen=300)
+        # last scan→map TF quality: "ok" | "clamped" | "drop"
+        self._scan_tf_quality: str = "ok"
+        self._scan_tf_skew_ms: float = 0.0
         # Smoothed command state for LPF / rate limit
         self._cmd_filt_v: float = 0.0
         self._cmd_filt_w: float = 0.0
@@ -386,8 +445,8 @@ class NeupanCore(Node):
         }
         self.viz_manager = VisualizationManager(self, viz_config)
 
-        # TF listener for coordinate transformations (default 10s buffer)
-        self.tf_buffer = tf2_ros.Buffer()
+        # Longer cache helps when scans briefly outrun odom TF
+        self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=30.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         scan_qos_profile = QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT)
@@ -471,34 +530,156 @@ class NeupanCore(Node):
     def _lookup_transform_at(
         self, target_frame: str, source_frame: str, stamp_msg
     ):
-        """Lookup TF at a message stamp; fall back to latest if history missing.
+        """Lookup TF at scan stamp with safe clamp; never apply badly-skewed TF.
 
-        优先用观测时间戳对齐；TF 缓冲不足时退回 latest，并 throttle 警告。
+        Returns:
+            (transform, quality) where quality is "ok" | "clamped"
+            or (None, "drop") if the temporal mismatch is too large.
+
+        依据真机日志：scan stamp 常比 TF 新 ~50ms（与旧 timeout=0.05 临界），
+        或 TF latest 落后 wall-clock 达 1–3s。无时间戳失败时无 latest 会把
+        点云投到错误世界位姿——这正是车体系/世界系“看起来像 bug”的主因。
         """
         timeout = Duration(seconds=self.tf_lookup_timeout)
+        stamp_sec = self._stamp_to_sec(stamp_msg)
+        now_sec = self._now_sec()
+
+        latest_tf = None
+        latest_sec = None
         try:
-            return self.tf_buffer.lookup_transform(
+            latest_tf = self.tf_buffer.lookup_transform(
+                target_frame, source_frame, Time(), timeout=timeout
+            )
+            latest_sec = self._stamp_to_sec(latest_tf.header.stamp)
+        except Exception as e_latest:
+            # #region agent log
+            _agent_dbg(
+                "H4",
+                "neupan_node_classmate_fix.py:_lookup_transform_at",
+                "latest_tf_unavailable",
+                {
+                    "target": target_frame,
+                    "source": source_frame,
+                    "stamp_sec": stamp_sec,
+                    "now_sec": now_sec,
+                    "err": str(e_latest)[:200],
+                },
+            )
+            # #endregion agent log
+            self.get_logger().warn(
+                f"No latest TF {source_frame}->{target_frame}: {e_latest}",
+                throttle_duration_sec=2.0,
+            )
+            return None, "drop"
+
+        tf_age = now_sec - latest_sec
+        stamp_minus_latest = stamp_sec - latest_sec
+
+        # TF itself is stale vs wall clock → drop (confirmed 1–3s lag in field logs)
+        if tf_age > self.max_tf_age:
+            # #region agent log
+            _agent_dbg(
+                "H4",
+                "neupan_node_classmate_fix.py:_lookup_transform_at",
+                "drop_stale_tf",
+                {
+                    "target": target_frame,
+                    "source": source_frame,
+                    "tf_age_ms": tf_age * 1000.0,
+                    "max_tf_age_ms": self.max_tf_age * 1000.0,
+                    "stamp_minus_latest_ms": stamp_minus_latest * 1000.0,
+                },
+            )
+            # #endregion agent log
+            self.get_logger().warn(
+                f"TF {source_frame}->{target_frame} too stale "
+                f"(age {tf_age*1000:.0f}ms > {self.max_tf_age*1000:.0f}ms); "
+                f"dropping scan",
+                throttle_duration_sec=2.0,
+            )
+            return None, "drop"
+
+        try:
+            trans = self.tf_buffer.lookup_transform(
                 target_frame,
                 source_frame,
                 Time.from_msg(stamp_msg),
                 timeout=timeout,
             )
+            # #region agent log
+            _agent_dbg(
+                "H1",
+                "neupan_node_classmate_fix.py:_lookup_transform_at",
+                "stamp_lookup_ok",
+                {
+                    "target": target_frame,
+                    "source": source_frame,
+                    "stamp_sec": stamp_sec,
+                    "latest_sec": latest_sec,
+                    "stamp_minus_latest_ms": stamp_minus_latest * 1000.0,
+                    "tf_age_ms": tf_age * 1000.0,
+                    "timeout_s": self.tf_lookup_timeout,
+                    "quality": "ok",
+                },
+            )
+            # #endregion agent log
+            return trans, "ok"
         except (
             tf2_ros.LookupException,
             tf2_ros.ConnectivityException,
             tf2_ros.ExtrapolationException,
         ) as e:
+            into_future = "into the future" in str(e)
+            # Small future skew (clock / publisher order): clamp to latest is OK
+            if into_future and stamp_minus_latest <= self.max_scan_tf_skew:
+                # #region agent log
+                _agent_dbg(
+                    "H1",
+                    "neupan_node_classmate_fix.py:_lookup_transform_at",
+                    "stamp_clamped_to_latest",
+                    {
+                        "target": target_frame,
+                        "source": source_frame,
+                        "stamp_minus_latest_ms": stamp_minus_latest * 1000.0,
+                        "max_skew_ms": self.max_scan_tf_skew * 1000.0,
+                        "tf_age_ms": tf_age * 1000.0,
+                        "quality": "clamped",
+                        "err": str(e)[:200],
+                    },
+                )
+                # #endregion agent log
+                self.get_logger().debug(
+                    f"TF stamp {stamp_minus_latest*1000:.0f}ms ahead of latest; "
+                    f"clamping (≤{self.max_scan_tf_skew*1000:.0f}ms)",
+                    throttle_duration_sec=2.0,
+                )
+                return latest_tf, "clamped"
+
+            # Large mismatch: DO NOT fallback — that was the world-frame bug
+            # #region agent log
+            _agent_dbg(
+                "H1",
+                "neupan_node_classmate_fix.py:_lookup_transform_at",
+                "drop_skewed_tf",
+                {
+                    "target": target_frame,
+                    "source": source_frame,
+                    "stamp_minus_latest_ms": stamp_minus_latest * 1000.0,
+                    "tf_age_ms": tf_age * 1000.0,
+                    "into_future": into_future,
+                    "max_skew_ms": self.max_scan_tf_skew * 1000.0,
+                    "quality": "drop",
+                    "err": str(e)[:240],
+                },
+            )
+            # #endregion agent log
             self.get_logger().warn(
-                f"TF@{source_frame}->{target_frame} at stamp failed ({e}); "
-                f"falling back to latest",
+                f"TF@{source_frame}->{target_frame} stamp failed "
+                f"(skew {stamp_minus_latest*1000:.0f}ms, age {tf_age*1000:.0f}ms); "
+                f"DROPPING scan instead of unsafe latest fallback ({e})",
                 throttle_duration_sec=2.0,
             )
-            return self.tf_buffer.lookup_transform(
-                target_frame,
-                source_frame,
-                Time(),  # latest
-                timeout=timeout,
-            )
+            return None, "drop"
 
     def _predict_pose_diff_drive(
         self, pose: npt.NDArray, v: float, w: float, dt: float
@@ -542,6 +723,20 @@ class NeupanCore(Node):
         少量 scan_age 的比例项，但默认只用求解+执行延迟，避免过大开环。
         """
         if not self.compensate_delay:
+            return pose_now
+
+        # 点云若只用了 clamped TF，时间基准已偏；再外推会叠误差（H2）
+        with self._state_lock:
+            quality = self._scan_tf_quality
+        if quality != "ok":
+            # #region agent log
+            _agent_dbg(
+                "H2",
+                "neupan_node_classmate_fix.py:_compensate_state_for_delay",
+                "skip_predict_due_to_scan_tf",
+                {"quality": quality, "scan_stamp_sec": scan_stamp_sec},
+            )
+            # #endregion agent log
             return pose_now
 
         with self._state_lock:
@@ -627,7 +822,64 @@ class NeupanCore(Node):
             # Optional short forward prediction with measured odom twist
             with self._state_lock:
                 scan_stamp = self._latest_scan_stamp
+            pose_tf = new_state.copy()
             new_state = self._compensate_state_for_delay(new_state, scan_stamp)
+
+            # #region agent log
+            with self._state_lock:
+                v_dbg, w_dbg = self._odom_twist
+                obs = self.obstacle_points
+            # throttle pose logs (~5 Hz at 50 Hz control) so TF/scan logs are not starved
+            if not hasattr(self, "_dbg_pose_n"):
+                self._dbg_pose_n = 0
+            self._dbg_pose_n += 1
+            if self._dbg_pose_n % 10 == 1:
+                obs_n = 0 if obs is None else int(obs.shape[1])
+                obs_centroid = None
+                if obs is not None and obs_n > 0:
+                    obs_centroid = [
+                        float(np.mean(obs[0])),
+                        float(np.mean(obs[1])),
+                    ]
+                _agent_dbg(
+                    "H2",
+                    "neupan_node_fixed.py:_get_robot_transform",
+                    "robot_pose_vs_predict",
+                    {
+                        "map_frame": self.map_frame,
+                        "base_frame": self.base_frame,
+                        "lidar_frame": self.lidar_frame,
+                        "pose_tf": [
+                            float(pose_tf[0, 0]),
+                            float(pose_tf[1, 0]),
+                            float(pose_tf[2, 0]),
+                        ],
+                        "pose_pred": [
+                            float(new_state[0, 0]),
+                            float(new_state[1, 0]),
+                            float(new_state[2, 0]),
+                        ],
+                        "dxy_pred_m": float(
+                            np.hypot(
+                                new_state[0, 0] - pose_tf[0, 0],
+                                new_state[1, 0] - pose_tf[1, 0],
+                            )
+                        ),
+                        "solve_ema_ms": self._solve_ema * 1000.0,
+                        "actuation_delay_ms": self.actuation_delay * 1000.0,
+                        "predict_dt_ms": min(
+                            self._solve_ema + self.actuation_delay,
+                            self.max_predict_horizon,
+                        )
+                        * 1000.0,
+                        "odom_vw": [float(v_dbg), float(w_dbg)],
+                        "scan_stamp": scan_stamp,
+                        "obs_n": obs_n,
+                        "obs_centroid_map": obs_centroid,
+                        "compensate": self.compensate_delay,
+                    },
+                )
+            # #endregion agent log
 
             # Lock only for writing shared state
             with self._state_lock:
@@ -848,11 +1100,15 @@ class NeupanCore(Node):
         point_array = np.vstack([x_coords, y_coords])
 
         try:
-            # CRITICAL: transform obstacles with TF at scan stamp, not "latest".
-            # 用扫描时刻位姿把点云放入 map，否则绕障后回参考线时障碍/状态错位会放大抖振。
-            trans = self._lookup_transform_at(
-                self.map_frame, self.lidar_frame, scan_msg.header.stamp
+            # Prefer LaserScan.header.frame_id when set (avoids lidar_frame mismatch)
+            lidar_frame = scan_msg.header.frame_id or self.lidar_frame
+            trans, quality = self._lookup_transform_at(
+                self.map_frame, lidar_frame, scan_msg.header.stamp
             )
+            if trans is None:
+                with self._state_lock:
+                    self._scan_tf_quality = "drop"
+                return None
 
             yaw = quat_to_yaw(trans.transform.rotation)
             x = trans.transform.translation.x
@@ -861,9 +1117,67 @@ class NeupanCore(Node):
             trans_matrix, rot_matrix = get_transform(np.c_[x, y, yaw].reshape(3, 1))
             transformed_points = rot_matrix @ point_array + trans_matrix
 
+            # #region agent log
+            with self._state_lock:
+                rs = None if self.robot_state is None else self.robot_state.copy()
+            sample_i = int(np.argmin(valid_ranges)) if len(valid_ranges) else 0
+            lidar_xy = (
+                [
+                    float(point_array[0, sample_i]),
+                    float(point_array[1, sample_i]),
+                ]
+                if point_array.shape[1]
+                else None
+            )
+            map_xy = (
+                [
+                    float(transformed_points[0, sample_i]),
+                    float(transformed_points[1, sample_i]),
+                ]
+                if transformed_points.shape[1]
+                else None
+            )
+            base_lidar_dx = None
+            if rs is not None:
+                base_lidar_dx = [
+                    float(x - rs[0, 0]),
+                    float(y - rs[1, 0]),
+                    float(_wrap_angle(yaw - rs[2, 0])),
+                ]
+            _agent_dbg(
+                "H3",
+                "neupan_node_classmate_fix.py:scan_callback",
+                "lidar_to_map_sample",
+                {
+                    "map_frame": self.map_frame,
+                    "lidar_frame_param": self.lidar_frame,
+                    "lidar_frame_used": lidar_frame,
+                    "scan_frame_id": scan_msg.header.frame_id,
+                    "tf_quality": quality,
+                    "tf_stamp_sec": self._stamp_to_sec(trans.header.stamp),
+                    "scan_stamp_sec": self._stamp_to_sec(scan_msg.header.stamp),
+                    "tf_pose_map": [float(x), float(y), float(yaw)],
+                    "robot_state": (
+                        None
+                        if rs is None
+                        else [float(rs[0, 0]), float(rs[1, 0]), float(rs[2, 0])]
+                    ),
+                    "lidar_vs_robot_dxy_dyaw": base_lidar_dx,
+                    "sample_lidar_xy": lidar_xy,
+                    "sample_map_xy": map_xy,
+                    "n_points": int(transformed_points.shape[1]),
+                    "frame_id_mismatch": (
+                        bool(scan_msg.header.frame_id)
+                        and scan_msg.header.frame_id != self.lidar_frame
+                    ),
+                },
+            )
+            # #endregion agent log
+
             # Lock only for writing shared state
             with self._state_lock:
                 self.obstacle_points = transformed_points
+                self._scan_tf_quality = quality
 
             self.get_logger().info(
                 f"Laser scan initialized with {transformed_points.shape[1]} "
