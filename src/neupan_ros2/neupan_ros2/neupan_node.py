@@ -8,10 +8,27 @@ planning algorithm, and publishes velocity commands to control the robot.
 
 Developer: Han Ruihua <hanrh@connect.hku.hk>  Li Chengyang <kevinladlee@gmail.com>
 Date: 2025.04.08
+
+Latency-aware real-robot revision (neupan_node_fixed.py)
+-------------------------------------------------------
+相对原始 neupan_node.py 的延迟处理原则（避免 dc_neupan_node 中的脆化方案）:
+
+1. 点云用 scan 时间戳上的 TF 变换到 map（观测与位姿时间对齐）
+2. 规划用“当前” TF 位姿；可选地用里程计实测 twist (v,w) 做短时外推
+   到动作生效时刻（scan_age + 求解EMA + 执行延迟），不用发布的 cmd_hist 开环积分
+3. 对输出 cmd 做轻度一阶低通 + 加加速度限幅，抑制绕障后回参考线时的抖振
+4. 保留原始 NeuPAN 控制/规划/可视化/多线程结构，不重写整条流水线
+
+对比实验开关:
+  compensate_delay:=false  → 仅时间戳同步点云，不做状态外推（最接近原版）
+  cmd_smoothing:=false     → 关闭输出滤波/限加速度
 """
+import math
 import os
 import threading
+import time
 import traceback
+from collections import deque
 from typing import Optional, Tuple, Dict, Any, List
 
 import numpy as np
@@ -21,11 +38,13 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
+from rclpy.duration import Duration
+from rclpy.time import Time
 from ament_index_python.packages import get_package_share_directory
 import tf2_ros
 
 from geometry_msgs.msg import Twist, PoseStamped
-from nav_msgs.msg import Path
+from nav_msgs.msg import Path, Odometry
 from sensor_msgs.msg import LaserScan
 
 try:
@@ -40,6 +59,11 @@ except ImportError as e:
 # Import local modules
 from neupan_ros2.visualization_manager import VisualizationManager
 from neupan_ros2.utils import yaw_to_quat, quat_to_yaw
+
+
+def _wrap_angle(a: float) -> float:
+    """Wrap angle to [-pi, pi]."""
+    return math.atan2(math.sin(a), math.cos(a))
 
 
 class NeupanCore(Node):
@@ -107,6 +131,25 @@ class NeupanCore(Node):
         self.declare_parameter("scan_topic", "/scan")
         self.declare_parameter("plan_input_topic", "/plan")
         self.declare_parameter("goal_topic", "/goal_pose")
+
+        # === Real-robot latency / smoothness parameters ===
+        # 用实测 odom twist 短时外推，替代 cmd_hist 开环 rollforward
+        self.declare_parameter("odom_topic", "/odom")
+        self.declare_parameter("compensate_delay", True)
+        # 电机/底盘执行滞后（命令发出 → 实际速度跟上），建议 0.05~0.20s
+        self.declare_parameter("actuation_delay", 0.08)
+        # 外推时间上限，防止长时间开环漂移；超过则钳位并打日志
+        self.declare_parameter("max_predict_horizon", 0.35)
+        # TF 查历史时允许的超时
+        self.declare_parameter("tf_lookup_timeout", 0.05)
+        # 输出平滑：一阶低通 alpha∈(0,1]，越小越平滑；1=关闭低通
+        self.declare_parameter("cmd_smoothing", True)
+        self.declare_parameter("cmd_lpf_alpha", 0.35)
+        # 加速度限幅 (m/s^2, rad/s^2)；0 表示不限制
+        self.declare_parameter("max_lin_acc", 0.8)
+        self.declare_parameter("max_ang_acc", 3.0)
+        # 周期延迟统计日志
+        self.declare_parameter("delay_report_period", 5.0)
 
         # === Configuration Loading ===
         # Get robot configuration directory (set by launch file)
@@ -215,6 +258,35 @@ class NeupanCore(Node):
             .get_parameter_value().bool_value
         )
 
+        # Latency / smoothing params
+        self.compensate_delay = (
+            self.get_parameter("compensate_delay").get_parameter_value().bool_value
+        )
+        self.actuation_delay = (
+            self.get_parameter("actuation_delay").get_parameter_value().double_value
+        )
+        self.max_predict_horizon = (
+            self.get_parameter("max_predict_horizon").get_parameter_value().double_value
+        )
+        self.tf_lookup_timeout = (
+            self.get_parameter("tf_lookup_timeout").get_parameter_value().double_value
+        )
+        self.cmd_smoothing = (
+            self.get_parameter("cmd_smoothing").get_parameter_value().bool_value
+        )
+        self.cmd_lpf_alpha = (
+            self.get_parameter("cmd_lpf_alpha").get_parameter_value().double_value
+        )
+        self.max_lin_acc = (
+            self.get_parameter("max_lin_acc").get_parameter_value().double_value
+        )
+        self.max_ang_acc = (
+            self.get_parameter("max_ang_acc").get_parameter_value().double_value
+        )
+        delay_report_period = (
+            self.get_parameter("delay_report_period").get_parameter_value().double_value
+        )
+
         if self.refresh_initial_path:
             self.get_logger().info("Refresh initial path is enabled")
 
@@ -238,6 +310,12 @@ class NeupanCore(Node):
             )
         self.get_logger().info(f"Robot kinematics: {self.neupan_planner.robot.kinematics}")
         self.get_logger().info("NeuPAN planner initialized successfully")
+        self.get_logger().info(
+            f"Latency compensate={self.compensate_delay}, "
+            f"actuation_delay={self.actuation_delay:.3f}s, "
+            f"max_predict={self.max_predict_horizon:.3f}s, "
+            f"cmd_smoothing={self.cmd_smoothing}"
+        )
 
         # Shared state protected by _state_lock (accessed by multiple threads)
         # Write access: scan_callback (obstacle_points), _get_robot_transform (robot_state)
@@ -248,6 +326,19 @@ class NeupanCore(Node):
         self.stop: bool = False  # Emergency stop flag from collision detection
         self.arrive: bool = False  # Goal reached flag
         self.goal: Optional[npt.NDArray] = None  # (3, 1) target goal [x, y, theta]
+
+        # --- Latency state (not using published-command history) ---
+        self._latest_scan_stamp: Optional[float] = None  # seconds
+        self._odom_twist = (0.0, 0.0)  # measured (v, w) from /odom
+        self._odom_stamp: Optional[float] = None
+        self._solve_ema: float = 0.05  # planner solve-time EMA (s)
+        self._stat_scan_age: deque = deque(maxlen=300)
+        self._stat_predict: deque = deque(maxlen=300)
+        self._stat_solve: deque = deque(maxlen=300)
+        # Smoothed command state for LPF / rate limit
+        self._cmd_filt_v: float = 0.0
+        self._cmd_filt_w: float = 0.0
+        self._last_cmd_time: Optional[float] = None
 
         self.vel_pub = self.create_publisher(
             Twist,
@@ -321,6 +412,17 @@ class NeupanCore(Node):
             10,
             callback_group=self.callback_group
         )
+        # 里程计：仅用实测速度做短时外推（不用 cmd_hist）
+        odom_topic = (
+            self.get_parameter("odom_topic").get_parameter_value().string_value
+        )
+        self.create_subscription(
+            Odometry,
+            odom_topic,
+            self.odom_callback,
+            20,
+            callback_group=self.callback_group
+        )
 
         # Control loop timer: frequency configurable via parameter
         self.control_frequency = (
@@ -340,6 +442,169 @@ class NeupanCore(Node):
         )
         self.create_timer(time_period, self.run, callback_group=self.control_group)
 
+        if delay_report_period > 0:
+            self.create_timer(
+                delay_report_period,
+                self._report_delay_stats,
+                callback_group=self.control_group,
+            )
+
+    # ------------------------------------------------------------------
+    # Latency helpers
+    # ------------------------------------------------------------------
+    def _stamp_to_sec(self, stamp) -> float:
+        return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+
+    def _now_sec(self) -> float:
+        t = self.get_clock().now().to_msg()
+        return self._stamp_to_sec(t)
+
+    def odom_callback(self, msg: Odometry) -> None:
+        """Cache measured body twist from odometry (not commanded velocity)."""
+        v = float(msg.twist.twist.linear.x)
+        w = float(msg.twist.twist.angular.z)
+        st = self._stamp_to_sec(msg.header.stamp)
+        with self._state_lock:
+            self._odom_twist = (v, w)
+            self._odom_stamp = st
+
+    def _lookup_transform_at(
+        self, target_frame: str, source_frame: str, stamp_msg
+    ):
+        """Lookup TF at a message stamp; fall back to latest if history missing.
+
+        优先用观测时间戳对齐；TF 缓冲不足时退回 latest，并 throttle 警告。
+        """
+        timeout = Duration(seconds=self.tf_lookup_timeout)
+        try:
+            return self.tf_buffer.lookup_transform(
+                target_frame,
+                source_frame,
+                Time.from_msg(stamp_msg),
+                timeout=timeout,
+            )
+        except (
+            tf2_ros.LookupException,
+            tf2_ros.ConnectivityException,
+            tf2_ros.ExtrapolationException,
+        ) as e:
+            self.get_logger().warn(
+                f"TF@{source_frame}->{target_frame} at stamp failed ({e}); "
+                f"falling back to latest",
+                throttle_duration_sec=2.0,
+            )
+            return self.tf_buffer.lookup_transform(
+                target_frame,
+                source_frame,
+                Time(),  # latest
+                timeout=timeout,
+            )
+
+    def _predict_pose_diff_drive(
+        self, pose: npt.NDArray, v: float, w: float, dt: float
+    ) -> npt.NDArray:
+        """Short-horizon unicycle prediction using measured (v, w).
+
+        仅用于短暂延迟补偿。转弯用精确圆弧积分，避免欧拉角误差放大位置偏差。
+        故意不用发布的 cmd_hist：命令≠实际速度，长历史开环积分会在转弯时抖。
+        """
+        if dt <= 0.0:
+            return pose.copy()
+
+        x = float(pose[0, 0])
+        y = float(pose[1, 0])
+        th = float(pose[2, 0])
+
+        if abs(w) < 1e-6:
+            # Nearly straight: Euler is fine and stable
+            x += v * math.cos(th) * dt
+            y += v * math.sin(th) * dt
+            th += w * dt
+        else:
+            # Exact circular-arc integration for constant (v, w)
+            th_new = th + w * dt
+            x += (v / w) * (math.sin(th_new) - math.sin(th))
+            y += (v / w) * (-math.cos(th_new) + math.cos(th))
+            th = th_new
+
+        out = np.array([[x], [y], [_wrap_angle(th)]], dtype=float)
+        return out
+
+    def _compensate_state_for_delay(
+        self, pose_now: npt.NDArray, scan_stamp_sec: Optional[float]
+    ) -> npt.NDArray:
+        """Predict pose at approximate command-apply time using odom twist.
+
+        total_delay ≈ (now - scan_stamp) 的一部分不必再外推（障碍已按扫描时刻
+        正确落在 map，当前 TF 已包含“扫描后到现在”的运动）；只需补偿：
+          remaining = solve_ema + actuation_delay
+        即从“现在”再往前推一点到动作生效。若想与观测龄更保守对齐，也可加上
+        少量 scan_age 的比例项，但默认只用求解+执行延迟，避免过大开环。
+        """
+        if not self.compensate_delay:
+            return pose_now
+
+        with self._state_lock:
+            v, w = self._odom_twist
+
+        # 规划求解耗时 EMA + 机电感测延迟；不把整段 scan_age 再外推一遍
+        # （当前 TF 位姿已是“现在”，点云已用 scan-time TF）
+        dt = max(0.0, self._solve_ema + self.actuation_delay)
+        if dt > self.max_predict_horizon:
+            self.get_logger().warn(
+                f"Predict horizon {dt*1000:.0f}ms clamped to "
+                f"{self.max_predict_horizon*1000:.0f}ms",
+                throttle_duration_sec=2.0,
+            )
+            dt = self.max_predict_horizon
+
+        self._stat_predict.append(dt)
+        if scan_stamp_sec is not None:
+            self._stat_scan_age.append(self._now_sec() - scan_stamp_sec)
+
+        return self._predict_pose_diff_drive(pose_now, v, w, dt)
+
+    def _smooth_cmd(self, v: float, w: float) -> Tuple[float, float]:
+        """Low-pass + acceleration limit on published commands."""
+        if not self.cmd_smoothing:
+            return v, w
+
+        now = self._now_sec()
+        if self._last_cmd_time is None:
+            dt = 1.0 / max(self.control_frequency, 1.0)
+        else:
+            dt = max(1e-3, now - self._last_cmd_time)
+        self._last_cmd_time = now
+
+        # First-order low-pass
+        a = float(np.clip(self.cmd_lpf_alpha, 0.05, 1.0))
+        v_f = a * v + (1.0 - a) * self._cmd_filt_v
+        w_f = a * w + (1.0 - a) * self._cmd_filt_w
+
+        # Rate / acceleration limiting (optional)
+        if self.max_lin_acc > 0.0:
+            dv_max = self.max_lin_acc * dt
+            v_f = float(np.clip(v_f, self._cmd_filt_v - dv_max, self._cmd_filt_v + dv_max))
+        if self.max_ang_acc > 0.0:
+            dw_max = self.max_ang_acc * dt
+            w_f = float(np.clip(w_f, self._cmd_filt_w - dw_max, self._cmd_filt_w + dw_max))
+
+        self._cmd_filt_v, self._cmd_filt_w = v_f, w_f
+        return v_f, w_f
+
+    def _report_delay_stats(self) -> None:
+        if not self._stat_scan_age and not self._stat_solve:
+            return
+        age = np.array(self._stat_scan_age) * 1000.0 if self._stat_scan_age else np.array([0.0])
+        sol = np.array(self._stat_solve) * 1000.0 if self._stat_solve else np.array([0.0])
+        pred = np.array(self._stat_predict) * 1000.0 if self._stat_predict else np.array([0.0])
+        self.get_logger().info(
+            f"[delay] scan_age {age.mean():.0f}/{age.max():.0f}ms | "
+            f"solve {sol.mean():.0f}/{sol.max():.0f}ms | "
+            f"predict {pred.mean():.0f}ms | "
+            f"comp={self.compensate_delay} smooth={self.cmd_smoothing}"
+        )
+
     def _get_robot_transform(self) -> bool:
         """Get robot transform from TF and update robot_state.
 
@@ -349,14 +614,20 @@ class NeupanCore(Node):
         """
         try:
             # TF query is thread-safe, no lock needed
+            # Use latest transform for "current" robot pose (planning reference).
             trans = self.tf_buffer.lookup_transform(
-                self.map_frame, self.base_frame, rclpy.time.Time()
+                self.map_frame, self.base_frame, Time()
             )
 
             yaw = quat_to_yaw(trans.transform.rotation)
             x = trans.transform.translation.x
             y = trans.transform.translation.y
             new_state = np.array([x, y, yaw]).reshape(3, 1)
+
+            # Optional short forward prediction with measured odom twist
+            with self._state_lock:
+                scan_stamp = self._latest_scan_stamp
+            new_state = self._compensate_state_for_delay(new_state, scan_stamp)
 
             # Lock only for writing shared state
             with self._state_lock:
@@ -449,9 +720,14 @@ class NeupanCore(Node):
 
         # Step 2: Execute planning OUTSIDE lock (10-50ms)
         # (allows other threads to access shared state)
+        t0 = time.monotonic()
         action, info = self.neupan_planner(
             robot_state_copy, obstacle_points_copy
         )
+        solve = time.monotonic() - t0
+        self._stat_solve.append(solve)
+        # EMA of solve time feeds next-cycle delay compensation
+        self._solve_ema = 0.9 * self._solve_ema + 0.1 * solve
 
         # Step 3: Write back results inside lock (< 0.1 μs)
         with self._state_lock:
@@ -538,6 +814,7 @@ class NeupanCore(Node):
         with self._state_lock:
             if self.robot_state is None:
                 return None
+            self._latest_scan_stamp = self._stamp_to_sec(scan_msg.header.stamp)
 
         ranges = np.array(scan_msg.ranges)
         angles = np.linspace(scan_msg.angle_min, scan_msg.angle_max, len(ranges))
@@ -571,8 +848,10 @@ class NeupanCore(Node):
         point_array = np.vstack([x_coords, y_coords])
 
         try:
-            trans = self.tf_buffer.lookup_transform(
-                self.map_frame, self.lidar_frame, rclpy.time.Time()
+            # CRITICAL: transform obstacles with TF at scan stamp, not "latest".
+            # 用扫描时刻位姿把点云放入 map，否则绕障后回参考线时障碍/状态错位会放大抖振。
+            trans = self._lookup_transform_at(
+                self.map_frame, self.lidar_frame, scan_msg.header.stamp
             )
 
             yaw = quat_to_yaw(trans.transform.rotation)
@@ -596,6 +875,12 @@ class NeupanCore(Node):
             self.get_logger().debug(
                 f"Waiting for transform from {self.lidar_frame} to {self.map_frame}",
                 throttle_duration_sec=1.0
+            )
+            return
+        except (tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            self.get_logger().warn(
+                f"Scan TF error: {e}",
+                throttle_duration_sec=1.0,
             )
             return
 
@@ -762,18 +1047,23 @@ class NeupanCore(Node):
 
         """
         if vel is None:
+            self._cmd_filt_v = 0.0
+            self._cmd_filt_w = 0.0
             return Twist()
 
         speed = float(vel[0, 0])
         steer = float(vel[1, 0])
 
         if stop or arrive:
+            self._cmd_filt_v = 0.0
+            self._cmd_filt_w = 0.0
             return Twist()
-        else:
-            action = Twist()
-            action.linear.x = speed
-            action.angular.z = steer
-            return action
+
+        speed, steer = self._smooth_cmd(speed, steer)
+        action = Twist()
+        action.linear.x = speed
+        action.angular.z = steer
+        return action
 
 
 def main(args=None):
