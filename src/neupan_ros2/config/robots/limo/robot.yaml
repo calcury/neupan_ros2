@@ -30,12 +30,7 @@ neupan_node:
     flip_angle: false
     refresh_initial_path: true
     include_initial_path_direction: false
-    control_frequency: 2.0  # Control loop frequency (Hz) — 延迟预测未启用时的回退值
-
-    # ========== 延迟预测（延迟补偿） ==========
-    use_delay_prediction: true    # 启用后定时器周期 = prediction_horizon
-    prediction_horizon: 1.0       # 预测步长（秒），与 step_time 独立
-    odom_topic: '/odom'           # 里程计话题，用于读取当前速度
+    control_frequency: 2.0  # Control loop frequency (Hz)
 
     # ========== Topic Configuration (Optional) ==========
     # Uncomment and modify to customize topic names for your robot
